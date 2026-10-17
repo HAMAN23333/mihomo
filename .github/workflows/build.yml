@@ -3,28 +3,85 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tag version to release"
+        description: "Unique prerelease version (for example v1.20.0-rc.1); existing tags are rejected"
         required: true
+        type: string
   push:
     paths-ignore:
       - "docs/**"
       - "README.md"
       - ".github/ISSUE_TEMPLATE/**"
     branches:
-      - Alpha
+      - "**"
     tags:
       - "v*"
   pull_request:
-    branches:
-      - Alpha
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
   
+permissions:
+  contents: read
+
 env:
   REGISTRY: docker.io
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 0
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+      - name: Test Lite release scripts
+        run: bash scripts/test-lite-release.sh
+      - name: Build and check host Lite binary
+        run: |
+          go build -tags "$(cat scripts/lite-tags.txt)" -trimpath -o "$RUNNER_TEMP/mihomo" .
+          bash scripts/check-lite.sh "$RUNNER_TEMP/mihomo"
+          python3 -I scripts/check-lite-dns.py "$RUNNER_TEMP/mihomo"
+
+  release-info:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      package-version: ${{ steps.version.outputs.package-version }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate release version
+        id: version
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="$GITHUB_REF_NAME"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            VERSION="$DISPATCH_VERSION"
+          fi
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || {
+            echo 'Version must be vMAJOR.MINOR.PATCH with an optional prerelease suffix' >&2
+            exit 1
+          }
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            # Dispatch creates a new prerelease at this SHA; never reuse or move a tag.
+            git ls-remote --tags --exit-code origin "refs/tags/$VERSION" > "$RUNNER_TEMP/existing-tag" && status=0 || status=$?
+            if [[ "$status" != 2 ]]; then
+              echo 'Prerelease tag already exists or remote tag lookup failed' >&2
+              exit 1
+            fi
+          fi
+          PACKAGE_VERSION="${VERSION#v}"
+          # RPM and Pacman version fields cannot contain a prerelease hyphen.
+          PACKAGE_VERSION="${PACKAGE_VERSION//-/.}"
+          printf 'version=%s\npackage-version=%s\n' "$VERSION" "$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+
   build:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: [verify, release-info]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -187,21 +244,17 @@ jobs:
       run: go env
 
     - name: Set variables
+      env:
+        VERSION: ${{ needs.release-info.outputs.version }}
+        PACKAGE_VERSION: ${{ needs.release-info.outputs.package-version }}
       run: |
-        VERSION="${GITHUB_REF_NAME,,}-$(git rev-parse --short HEAD)"
-        VERSION="${VERSION//\//-}"
-        PackageVersion="$(curl -s "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | jq -r '.tag_name' | sed 's/v//g' | awk -F '.' '{$NF = $NF + 1; print}' OFS='.').${VERSION/-/.}"
-        if [ -n "${{ github.event.inputs.version }}" ]; then
-          VERSION=${{ github.event.inputs.version }}
-          PackageVersion="${VERSION#v}"
-        fi
-        echo "VERSION=${VERSION}" >> $GITHUB_ENV
-        echo "PackageVersion=${PackageVersion}" >> $GITHUB_ENV
-      
-        echo "BUILDTIME=$(date)" >> $GITHUB_ENV
-        echo "CGO_ENABLED=0" >> $GITHUB_ENV
-        echo "BUILDTAG=-extldflags --static" >> $GITHUB_ENV
-        echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
+        echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+        echo "PackageVersion=${PACKAGE_VERSION}" >> "$GITHUB_ENV"
+        echo "LITE_TAGS=$(cat scripts/lite-tags.txt)" >> "$GITHUB_ENV"
+        echo "BUILDTIME=$(date -u)" >> "$GITHUB_ENV"
+        echo "CGO_ENABLED=0" >> "$GITHUB_ENV"
+        echo "BUILDTAG=-extldflags --static" >> "$GITHUB_ENV"
+        echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
 
     - name: Setup NDK
       if: ${{ matrix.jobs.goos == 'android' }}
@@ -225,6 +278,7 @@ jobs:
         go test ./...
         echo "---test with_gvisor---"
         go test ./... -tags "with_gvisor" -count=1
+        go test ./... -tags "$LITE_TAGS" -count=1
 
     - name: Update CA
       run: |
@@ -242,15 +296,36 @@ jobs:
         GOMIPS: ${{matrix.jobs.gomips}}
       run: |
         go env
-        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
-        if [ "${{matrix.jobs.goos}}" = "windows" ]; then
-          cp mihomo.exe mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
-          zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+        go build -v -tags "$LITE_TAGS" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+
+    - name: Check Lite binary
+      env:
+        TARGET_OS: ${{ matrix.jobs.goos }}
+        TARGET_ARCH: ${{ matrix.jobs.goarch }}
+        TARGET_AMD64: ${{ matrix.jobs.goamd64 }}
+      run: |
+        binary=./mihomo
+        [[ "$TARGET_OS" != windows ]] || binary=./mihomo.exe
+        # Only runner-native ABI/CPU targets can execute; all others still check Go metadata.
+        if [[ "$TARGET_OS" == linux && "$TARGET_ARCH" == amd64 && "$TARGET_AMD64" =~ ^v[123]$ ]]; then
+          bash scripts/check-lite.sh "$binary"
         else
-          cp mihomo mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
-          gzip -c mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}} > mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.gz
-          rm mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}
+          bash scripts/check-lite.sh "$binary" --metadata-only
         fi
+
+    - name: Package raw and admitted UPX variants
+      env:
+        TARGET_OS: ${{ matrix.jobs.goos }}
+        TARGET_OUTPUT: ${{ matrix.jobs.output }}
+      run: |
+        set -euo pipefail
+        binary=./mihomo
+        [[ "$TARGET_OS" != windows ]] || binary=./mihomo.exe
+        if grep -Fxq "$TARGET_OS-$TARGET_OUTPUT" scripts/upx-targets.txt; then
+          UPX_BIN="$(bash scripts/install-upx.sh "$RUNNER_TEMP/lite-upx")"
+          export UPX_BIN
+        fi
+        bash scripts/package-lite.sh "$binary" "$TARGET_OS" "$TARGET_OUTPUT" "$VERSION" .
 
     - name: Package DEB
       if: matrix.jobs.debian != ''
@@ -261,7 +336,7 @@ jobs:
 
         fpm -t deb \
           -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.deb" \
+          -p "mihomo-lite-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.deb" \
           --architecture ${{ matrix.jobs.debian }} \
           mihomo=/usr/bin/mihomo
 
@@ -274,7 +349,7 @@ jobs:
 
         fpm -t rpm \
           -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.rpm" \
+          -p "mihomo-lite-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.rpm" \
           --architecture ${{ matrix.jobs.rpm }} \
           mihomo=/usr/bin/mihomo
 
@@ -288,7 +363,7 @@ jobs:
 
         fpm -t pacman \
           -v "${PackageVersion}" \
-          -p "mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.pkg.tar.zst" \
+          -p "mihomo-lite-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.pkg.tar.zst" \
           --architecture ${{ matrix.jobs.pacman }} \
           mihomo=/usr/bin/mihomo
 
@@ -307,10 +382,24 @@ jobs:
         go mod vendor
         tar -czf $GITHUB_WORKSPACE/vendor.tar.gz vendor
 
-    - name: Save version
+    - name: Validate required target assets
+      env:
+        TARGET_OS: ${{ matrix.jobs.goos }}
+        TARGET_OUTPUT: ${{ matrix.jobs.output }}
+        DEB: ${{ matrix.jobs.debian }}
+        RPM: ${{ matrix.jobs.rpm }}
+        PACMAN: ${{ matrix.jobs.pacman }}
       run: |
-        echo ${VERSION} > version.txt
-      shell: bash
+        bash scripts/check-assets.sh "$TARGET_OS" "$TARGET_OUTPUT" "$VERSION" . "$DEB" "$RPM" "$PACMAN"
+        if [[ '${{ matrix.jobs.tarball }}' == tarball ]]; then
+          test -s toolchain.tar.gz
+          tar -tzf toolchain.tar.gz >/dev/null
+          test -s vendor.tar.gz
+          tar -tzf vendor.tar.gz >/dev/null
+        fi
+
+    - name: Save version
+      run: printf '%s\n' "$VERSION" > version.txt
 
     - name: Archive production artifacts
       uses: actions/upload-artifact@v7
@@ -325,216 +414,115 @@ jobs:
           toolchain.tar.gz
           vendor.tar.gz
           version.txt
-          checksums.txt
+        if-no-files-found: error
 
-  Upload-Prerelease:
-    permissions: write-all
-    if: ${{ github.event_name != 'workflow_dispatch' && github.ref_type == 'branch' && !startsWith(github.event_name, 'pull_request') }}
-    needs: [build]
-    runs-on: ubuntu-latest
+  windows-upx-smoke:
+    needs: [build, release-info]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
-    - name: Download all workflow run artifacts
-      uses: actions/download-artifact@v8
-      with:
-        path: bin/
-        merge-multiple: true
-
-    - name: Calculate checksums
-      run: |
-        cd bin/
-        find . -type f -not -name "checksums.*" -not -name "version.txt" | sort | xargs sha256sum > checksums.txt
-        cat checksums.txt
-      shell: bash
-
-    - name: Delete current release assets
-      uses: 8Mi-Tech/delete-release-assets-action@main
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        tag: Prerelease-${{ github.ref_name }}
-        deleteOnlyFromDrafts: false
-    - name: Set Env
-      run: |
-        echo "BUILDTIME=$(TZ=Asia/Shanghai date)" >> $GITHUB_ENV
-      shell: bash
-
-    - name: Tag Repo
-      uses: richardsimko/update-tag@v3
-      with:
-        tag_name: Prerelease-${{ github.ref_name }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-    - run: |
-        cat > release.txt << 'EOF'
-        Release created at  ${{ env.BUILDTIME }}
-        Synchronize ${{ github.ref_name }} branch code updates, keeping only the latest version
-        <br>
-        [我应该下载哪个文件? / Which file should I download?](https://github.com/MetaCubeX/mihomo/wiki/FAQ)
-        [二进制文件筛选 / Binary file selector](https://metacubex.github.io/Meta-Docs/startup/#_1)
-        [查看文档 / Docs](https://metacubex.github.io/Meta-Docs/)
-        EOF
-
-    - name: Upload Prerelease
-      uses: softprops/action-gh-release@v3
-      if: ${{  success() }}
-      with:
-        tag_name: Prerelease-${{ github.ref_name }}
-        files: |
-          bin/*
-        prerelease: true
-        generate_release_notes: true
-        body_path: release.txt
-
-  Upload-Release:
-    permissions: write-all
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          ref: Meta
-          fetch-depth: '0'
-          fetch-tags: 'true'
-
-      - name: Get tags
-        run: |
-          echo "CURRENTVERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
-          git fetch --tags
-          echo "PREVERSION=$(git describe --tags --abbrev=0 HEAD)" >> $GITHUB_ENV
-
-      - name: Force push Alpha branch to Meta
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git fetch origin Alpha:Alpha
-          git push origin Alpha:Meta --force
+          go-version: '1.26'
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-amd64-v1
+          path: assets/
+      - name: Run native raw and UPX checks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Tag the commit on Alpha
+          VERSION: ${{ needs.release-info.outputs.version }}
         run: |
-          git checkout Alpha 
-          git tag ${{ github.event.inputs.version }}
-          git push origin ${{ github.event.inputs.version }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          set -euo pipefail
+          mkdir raw upx
+          unzip -q "assets/mihomo-lite-windows-amd64-v1-$VERSION.zip" -d raw
+          unzip -q "assets/mihomo-lite-windows-amd64-v1-upx-$VERSION.zip" -d upx
+          bash scripts/check-lite.sh ./raw/mihomo-lite-windows-amd64-v1.exe
+          bash scripts/check-lite.sh ./upx/mihomo-lite-windows-amd64-v1-upx.exe --packed
+          python -I scripts/check-lite-dns.py ./raw/mihomo-lite-windows-amd64-v1.exe
+          python -I scripts/check-lite-dns.py ./upx/mihomo-lite-windows-amd64-v1-upx.exe
 
-      - name: Generate release notes
-        run: |
-            cp ./.github/genReleaseNote.sh ./
-            bash ./genReleaseNote.sh -v ${PREVERSION}...${CURRENTVERSION}
-            rm ./genReleaseNote.sh
-  
+  publish:
+    permissions:
+      contents: write
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: [build, release-info, windows-upx-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
         with:
           path: bin/
           merge-multiple: true
-  
-      - name: Display structure of downloaded files
-        run: ls -R
-        working-directory: bin
-  
-      - name: Upload Release
+      - name: Preserve source support asset and calculate checksums
+        env:
+          VERSION: ${{ needs.release-info.outputs.version }}
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz --prefix="mihomo-$VERSION/" -o "bin/source-$VERSION.tar.gz" HEAD
+          cd bin
+          rm version.txt
+          find . -type f -not -name 'checksums.*' -print0 | sort -z | xargs -0 sha256sum > checksums.txt
+      - name: Write Lite release notes
+        run: |
+          cat > release.txt <<'EOF'
+          This release contains only the Lite build profile: with_gvisor no_tailscale no_zerotier no_easytier.
+          Tailscale, ZeroTier and EasyTier are excluded; other upstream capabilities remain enabled.
+          Every upstream target has a non-UPX archive named mihomo-lite-<os>-<target>-<version>.
+          Validated targets additionally provide mihomo-lite-<os>-<target>-upx-<version> archives, produced from the same binary.
+          System packages and container images use the non-UPX binary; the command and system package name remain mihomo.
+          EOF
+      - name: Publish release or dispatch prerelease
         uses: softprops/action-gh-release@v3
-        if: ${{ success() }}
         with:
-          tag_name: ${{ github.event.inputs.version }}
+          tag_name: ${{ needs.release-info.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+          generate_release_notes: true
+          body_path: release.txt
+          fail_on_unmatched_files: true
           files: bin/*
-          body_path: release.md
 
   Docker:
-    if: ${{ !startsWith(github.event_name, 'pull_request') }}
-    permissions: write-all
-    needs: [build]
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
+    needs: [build, release-info, windows-upx-smoke]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
         with:
           path: bin/
           merge-multiple: true
-
-      - name: Display structure of downloaded files
-        run: ls -R
-        working-directory: bin
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          version: latest
-      
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
       - name: Extract Docker metadata
-        if: ${{ github.event_name != 'workflow_dispatch' }}
-        id: meta_alpha
-        uses: docker/metadata-action@v6
-        with:
-          images: '${{ env.REGISTRY }}/${{ github.repository }}'
-      
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
-        id: meta_release
+        id: meta
         uses: docker/metadata-action@v6
         with:
           images: '${{ env.REGISTRY }}/${{ github.repository }}'
           tags: |
-            ${{ github.event.inputs.version }}
+            type=raw,value=${{ needs.release-info.outputs.version }}
           flavor: |
-            latest=true
-          labels: org.opencontainers.image.version=${{ github.event.inputs.version }}
-      
-      - name: Show files
-        run: |
-          ls .
-          ls bin/
-      
-      - name: login to docker REGISTRY
+            latest=${{ github.event_name == 'push' }}
+          labels: org.opencontainers.image.version=${{ needs.release-info.outputs.version }}
+      - name: Log in to Docker registry
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.DOCKER_HUB_USER }}
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
-
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
-      - name: Build and push Docker image
-        if: ${{ github.event_name != 'workflow_dispatch' }}
+      - name: Build and push non-UPX Docker image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           platforms: |
             linux/386
             linux/amd64
             linux/arm64
             linux/arm/v7
-          tags: ${{ steps.meta_alpha.outputs.tags }}
-          labels: ${{ steps.meta_alpha.outputs.labels }}
-      
-      - name: Build and push Docker image
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version != '' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          platforms: |
-            linux/386
-            linux/amd64
-            linux/arm64
-            linux/arm/v7
-          tags: ${{ steps.meta_release.outputs.tags }}
-          labels: ${{ steps.meta_release.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
