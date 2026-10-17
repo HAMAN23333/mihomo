@@ -3,6 +3,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+# Stable tag pushes alone may publish stable releases and Docker latest.
+test "$(bash scripts/release-channel.sh push v1.20.0)" = $'prerelease=false\nlatest=true'
+test "$(bash scripts/release-channel.sh push v1.20.0-rc.1)" = $'prerelease=true\nlatest=false'
+test "$(bash scripts/release-channel.sh workflow_dispatch v1.20.0)" = $'prerelease=true\nlatest=false'
+test "$(bash scripts/release-channel.sh workflow_dispatch v1.20.0-rc.1)" = $'prerelease=true\nlatest=false'
 printf 'original binary\n' > "$work/mihomo.exe"
 bash scripts/package-lite.sh "$work/mihomo.exe" windows arm64 v1.2.3 "$work/assets"
 test -s "$work/assets/mihomo-lite-windows-arm64-v1.2.3.zip"
