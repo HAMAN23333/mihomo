@@ -11,9 +11,9 @@ RUN apk add --no-cache gzip && \
 COPY docker/file-name.sh /mihomo/file-name.sh
 WORKDIR /mihomo
 COPY bin/ bin/
-RUN FILE_NAME=`sh file-name.sh` && echo $FILE_NAME && \
-    FILE_NAME=`ls bin/ | egrep "$FILE_NAME.gz"|awk NR==1` && echo $FILE_NAME && \
-    mv bin/$FILE_NAME mihomo.gz && gzip -d mihomo.gz && chmod +x mihomo && echo "$FILE_NAME" > /mihomo-config/test
+RUN FILE_NAME="$(sh file-name.sh)" && \
+    gzip -dc "bin/$FILE_NAME" > mihomo && \
+    chmod +x mihomo && printf '%s\n' "$FILE_NAME" > /mihomo-config/test
 FROM alpine:latest
 LABEL org.opencontainers.image.source="https://github.com/MetaCubeX/mihomo"
 

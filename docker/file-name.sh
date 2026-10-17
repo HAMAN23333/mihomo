@@ -1,5 +1,6 @@
 #!/bin/sh
-os="mihomo-linux-"
+set -eu
+os="mihomo-lite-linux-"
 case $TARGETPLATFORM in
     "linux/amd64")
         arch="amd64-v1"
@@ -21,5 +22,6 @@ case $TARGETPLATFORM in
         exit 1
         ;;        
 esac
-file_name="$os$arch-$(cat bin/version.txt)"
-echo $file_name
+file_name="$os$arch-$(cat bin/version.txt).gz"
+test -s "bin/$file_name"
+printf '%s\n' "$file_name"
