@@ -1,24 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 binary="$1"
-if [[ "${2:-}" != --packed ]]; then
+profile="$2"
+mode="${3:-}"
+scripts="$(cd "$(dirname "$0")" && pwd)"
+source "$scripts/lite-profile.sh"
+lite_profile "$profile"
+expect_gvisor="$LITE_PROFILE_EXPECT_GVISOR"
+expected_tags="$(<"$LITE_PROFILE_TAGS_FILE")"
+case "$mode" in
+  ''|--packed|--metadata-only) ;;
+  *) printf 'Unknown Lite check mode: %s\n' "$mode" >&2; exit 2 ;;
+esac
+if [[ "$mode" != --packed ]]; then
   info="$(go version -m "$binary")"
-  for tag in with_gvisor no_tailscale no_zerotier no_easytier; do
-    if ! grep -E -- '-tags=.*' <<< "$info" | grep -qw "$tag"; then
+  tags="$(grep -E -- '-tags=.*' <<< "$info" || true)"
+  for tag in $expected_tags; do
+    if ! grep -qw "$tag" <<< "$tags"; then
       printf 'Missing Lite build tag: %s\n' "$tag" >&2; exit 1
     fi
   done
+  if ! "$expect_gvisor" && grep -qw with_gvisor <<< "$tags"; then
+    printf 'Unexpected no-GVisor build tag: with_gvisor\n' >&2; exit 1
+  fi
   if grep -Eq 'dep[[:space:]]+github.com/(metacubex/(tailscale|zerotier-go)|easytier/easytier/easytier-go)[[:space:]]' <<< "$info"; then
     printf 'Excluded SDK linked into %s\n' "$binary" >&2; exit 1
   fi
+  if ! "$expect_gvisor" && grep -Eq 'dep[[:space:]]+github.com/metacubex/gvisor[[:space:]]' <<< "$info"; then
+    printf 'gVisor linked into no-GVisor binary: %s\n' "$binary" >&2; exit 1
+  fi
 fi
-[[ "${2:-}" != --metadata-only ]] || exit 0
+[[ "$mode" != --metadata-only ]] || exit 0
 # Resolve the executable before changing to isolated configuration directories.
 binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
 version="$("$binary" -v)"
-for tag in with_gvisor no_tailscale no_zerotier no_easytier; do
+for tag in $expected_tags; do
   grep -qw "$tag" <<< "$version"
 done
+if ! "$expect_gvisor"; then
+  ! grep -qw with_gvisor <<< "$version"
+  exit 0
+fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 printf 'mode: direct\nrules: []\n' > "$work/config.yaml"

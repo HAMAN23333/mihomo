@@ -5,11 +5,15 @@ goos="$2"
 output="$3"
 version="$4"
 dest="$5"
+profile="${6:-}"
 scripts="$(cd "$(dirname "$0")" && pwd)"
+source "$scripts/lite-profile.sh"
+lite_profile "$profile"
+qualifier="$LITE_PROFILE_QUALIFIER"
 mkdir -p "$dest"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-name="mihomo-lite-$goos-$output"
+name="mihomo-lite-$goos-$output$qualifier"
 ext=''
 [[ "$goos" != windows ]] || ext='.exe'
 archive() {

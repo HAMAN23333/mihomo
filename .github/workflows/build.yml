@@ -37,12 +37,16 @@ jobs:
         with:
           go-version: '1.26'
       - name: Test Lite release scripts
-        run: bash scripts/test-lite-release.sh
-      - name: Build and check host Lite binary
+        run: |
+          bash scripts/test-lite-release.sh
+          bash scripts/test-local-build.sh
+      - name: Build and check host Lite binaries
         run: |
           go build -tags "$(cat scripts/lite-tags.txt)" -trimpath -o "$RUNNER_TEMP/mihomo" .
-          bash scripts/check-lite.sh "$RUNNER_TEMP/mihomo"
+          bash scripts/check-lite.sh "$RUNNER_TEMP/mihomo" gvisor
           python3 -I scripts/check-lite-dns.py "$RUNNER_TEMP/mihomo"
+          go build -tags "$(cat scripts/lite-no-gvisor-tags.txt)" -trimpath -o "$RUNNER_TEMP/mihomo-no-gvisor" .
+          bash scripts/check-lite.sh "$RUNNER_TEMP/mihomo-no-gvisor" no-gvisor
 
   release-info:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
@@ -254,6 +258,7 @@ jobs:
         echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
         echo "PackageVersion=${PACKAGE_VERSION}" >> "$GITHUB_ENV"
         echo "LITE_TAGS=$(cat scripts/lite-tags.txt)" >> "$GITHUB_ENV"
+        echo "LITE_NO_GVISOR_TAGS=$(cat scripts/lite-no-gvisor-tags.txt)" >> "$GITHUB_ENV"
         echo "BUILDTIME=$(date -u)" >> "$GITHUB_ENV"
         echo "CGO_ENABLED=0" >> "$GITHUB_ENV"
         echo "BUILDTAG=-extldflags --static" >> "$GITHUB_ENV"
@@ -282,6 +287,7 @@ jobs:
         echo "---test with_gvisor---"
         go test ./... -tags "with_gvisor" -count=1
         go test ./... -tags "$LITE_TAGS" -count=1
+        go test ./... -tags "$LITE_NO_GVISOR_TAGS" -count=1
 
     - name: Update CA
       run: |
@@ -300,6 +306,9 @@ jobs:
       run: |
         go env
         go build -v -tags "$LITE_TAGS" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+        no_gvisor_binary=./mihomo-no-gvisor
+        [[ "$GOOS" != windows ]] || no_gvisor_binary=./mihomo-no-gvisor.exe
+        go build -v -tags "$LITE_NO_GVISOR_TAGS" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" -o "$no_gvisor_binary"
 
     - name: Check Lite binary
       env:
@@ -308,12 +317,18 @@ jobs:
         TARGET_AMD64: ${{ matrix.jobs.goamd64 }}
       run: |
         binary=./mihomo
-        [[ "$TARGET_OS" != windows ]] || binary=./mihomo.exe
+        no_gvisor_binary=./mihomo-no-gvisor
+        if [[ "$TARGET_OS" == windows ]]; then
+          binary=./mihomo.exe
+          no_gvisor_binary=./mihomo-no-gvisor.exe
+        fi
         # Only runner-native ABI/CPU targets can execute; all others still check Go metadata.
         if [[ "$TARGET_OS" == linux && "$TARGET_ARCH" == amd64 && "$TARGET_AMD64" =~ ^v[123]$ ]]; then
-          bash scripts/check-lite.sh "$binary"
+          bash scripts/check-lite.sh "$binary" gvisor
+          bash scripts/check-lite.sh "$no_gvisor_binary" no-gvisor
         else
-          bash scripts/check-lite.sh "$binary" --metadata-only
+          bash scripts/check-lite.sh "$binary" gvisor --metadata-only
+          bash scripts/check-lite.sh "$no_gvisor_binary" no-gvisor --metadata-only
         fi
 
     - name: Package raw and admitted UPX variants
@@ -323,12 +338,17 @@ jobs:
       run: |
         set -euo pipefail
         binary=./mihomo
-        [[ "$TARGET_OS" != windows ]] || binary=./mihomo.exe
+        no_gvisor_binary=./mihomo-no-gvisor
+        if [[ "$TARGET_OS" == windows ]]; then
+          binary=./mihomo.exe
+          no_gvisor_binary=./mihomo-no-gvisor.exe
+        fi
         if grep -Fxq "$TARGET_OS-$TARGET_OUTPUT" scripts/upx-targets.txt; then
           UPX_BIN="$(bash scripts/install-upx.sh "$RUNNER_TEMP/lite-upx")"
           export UPX_BIN
         fi
-        bash scripts/package-lite.sh "$binary" "$TARGET_OS" "$TARGET_OUTPUT" "$VERSION" .
+        bash scripts/package-lite.sh "$binary" "$TARGET_OS" "$TARGET_OUTPUT" "$VERSION" . gvisor
+        bash scripts/package-lite.sh "$no_gvisor_binary" "$TARGET_OS" "$TARGET_OUTPUT" "$VERSION" . no-gvisor
 
     - name: Package DEB
       if: matrix.jobs.debian != ''
@@ -439,11 +459,15 @@ jobs:
           VERSION: ${{ needs.release-info.outputs.version }}
         run: |
           set -euo pipefail
-          mkdir raw upx
+          mkdir raw upx no-gvisor no-gvisor-upx
           unzip -q "assets/mihomo-lite-windows-amd64-v1-$VERSION.zip" -d raw
           unzip -q "assets/mihomo-lite-windows-amd64-v1-upx-$VERSION.zip" -d upx
-          bash scripts/check-lite.sh ./raw/mihomo-lite-windows-amd64-v1.exe
-          bash scripts/check-lite.sh ./upx/mihomo-lite-windows-amd64-v1-upx.exe --packed
+          unzip -q "assets/mihomo-lite-windows-amd64-v1-no-gvisor-$VERSION.zip" -d no-gvisor
+          unzip -q "assets/mihomo-lite-windows-amd64-v1-no-gvisor-upx-$VERSION.zip" -d no-gvisor-upx
+          bash scripts/check-lite.sh ./raw/mihomo-lite-windows-amd64-v1.exe gvisor
+          bash scripts/check-lite.sh ./upx/mihomo-lite-windows-amd64-v1-upx.exe gvisor --packed
+          bash scripts/check-lite.sh ./no-gvisor/mihomo-lite-windows-amd64-v1-no-gvisor.exe no-gvisor
+          bash scripts/check-lite.sh ./no-gvisor-upx/mihomo-lite-windows-amd64-v1-no-gvisor-upx.exe no-gvisor --packed
           python -I scripts/check-lite-dns.py ./raw/mihomo-lite-windows-amd64-v1.exe
           python -I scripts/check-lite-dns.py ./upx/mihomo-lite-windows-amd64-v1-upx.exe
 
@@ -471,11 +495,11 @@ jobs:
       - name: Write Lite release notes
         run: |
           cat > release.txt <<'EOF'
-          This release contains only the Lite build profile: with_gvisor no_tailscale no_zerotier no_easytier.
-          Tailscale, ZeroTier and EasyTier are excluded; other upstream capabilities remain enabled.
-          Every upstream target has a non-UPX archive named mihomo-lite-<os>-<target>-<version>.
-          Validated targets additionally provide mihomo-lite-<os>-<target>-upx-<version> archives, produced from the same binary.
-          System packages and container images use the non-UPX binary; the command and system package name remain mihomo.
+          This release contains two Lite capability profiles; both exclude Tailscale, ZeroTier and EasyTier.
+          The unqualified mihomo-lite-<os>-<target>-<version> archive includes gVisor and preserves existing download URLs.
+          The mihomo-lite-<os>-<target>-no-gvisor-<version> archive omits gVisor for users who do not need that capability.
+          Validated targets additionally provide matching archives with upx before the version; UPX changes packaging, not capabilities.
+          System packages and container images use the standard gVisor profile; the command and system package name remain mihomo.
           EOF
       - name: Publish release or dispatch prerelease
         uses: softprops/action-gh-release@v3

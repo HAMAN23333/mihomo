@@ -31,8 +31,10 @@ jobs:
         run: go test ./... -count=1
       - name: Test upstream gVisor profile
         run: go test ./... -count=1 -tags with_gvisor
-      - name: Test Lite profile
+      - name: Test Lite gVisor profile
         run: go test ./... -count=1 -tags "$(cat scripts/lite-tags.txt)"
+      - name: Test Lite no-GVisor profile
+        run: go test ./... -count=1 -tags "$(cat scripts/lite-no-gvisor-tags.txt)"
 
   compatibility:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
@@ -91,5 +93,8 @@ jobs:
       - name: Test with tag with_gvisor
         run: go test ./... -v -count=1 -tags "with_gvisor"
 
-      - name: Test Lite profile
+      - name: Test Lite gVisor profile
         run: go test ./... -v -count=1 -tags "$(cat scripts/lite-tags.txt)"
+
+      - name: Test Lite no-GVisor profile
+        run: go test ./... -v -count=1 -tags "$(cat scripts/lite-no-gvisor-tags.txt)"
