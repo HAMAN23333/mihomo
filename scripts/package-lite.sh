@@ -5,11 +5,17 @@ goos="$2"
 output="$3"
 version="$4"
 dest="$5"
+profile="${6:-}"
 scripts="$(cd "$(dirname "$0")" && pwd)"
+case "$profile" in
+  gvisor) qualifier='' ;;
+  no-gvisor) qualifier='-no-gvisor' ;;
+  *) printf 'Unknown Lite capability profile: %s\n' "$profile" >&2; exit 2 ;;
+esac
 mkdir -p "$dest"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-name="mihomo-lite-$goos-$output"
+name="mihomo-lite-$goos-$output$qualifier"
 ext=''
 [[ "$goos" != windows ]] || ext='.exe'
 archive() {
