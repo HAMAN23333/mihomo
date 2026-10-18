@@ -37,7 +37,9 @@ jobs:
         with:
           go-version: '1.26'
       - name: Test Lite release scripts
-        run: bash scripts/test-lite-release.sh
+        run: |
+          bash scripts/test-lite-release.sh
+          bash scripts/test-local-build.sh
       - name: Build and check host Lite binaries
         run: |
           go build -tags "$(cat scripts/lite-tags.txt)" -trimpath -o "$RUNNER_TEMP/mihomo" .

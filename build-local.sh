@@ -10,6 +10,7 @@ if ! command -v go >/dev/null 2>&1; then
   fi
 fi
 export CGO_ENABLED=0 GOTOOLCHAIN=local
+source scripts/lite-profile.sh
 profile=both
 with_upx=false
 while [[ $# -gt 0 ]]; do
@@ -38,23 +39,17 @@ esac
 version="custom-$(git rev-parse --short HEAD)"
 build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ldflags="-X github.com/metacubex/mihomo/constant.Version=$version -X github.com/metacubex/mihomo/constant.BuildTime=$build_time -w -s -buildid="
-mkdir -p bin/local
+output_dir="${LITE_OUTPUT_DIR:-bin/local}"
+mkdir -p "$output_dir"
 produced=()
 
 go version
 go mod download
 go mod verify
 for capability in "${profiles[@]}"; do
-  case "$capability" in
-    gvisor)
-      tags="$(<scripts/lite-tags.txt)"
-      qualifier=''
-      ;;
-    no-gvisor)
-      tags="$(<scripts/lite-no-gvisor-tags.txt)"
-      qualifier='-no-gvisor'
-      ;;
-  esac
+  lite_profile "$capability"
+  tags="$(<"$LITE_PROFILE_TAGS_FILE")"
+  qualifier="$LITE_PROFILE_QUALIFIER"
   for target in windows-amd64 linux-amd64 linux-arm64; do
     os="${target%-*}"
     arch="${target#*-}"
@@ -62,7 +57,7 @@ for capability in "${profiles[@]}"; do
     [[ "$arch" != amd64 ]] || output=amd64-v3
     name="mihomo-lite-$os-$output$qualifier"
     [[ "$os" != windows ]] || name="$name.exe"
-    path="bin/local/$name"
+    path="$output_dir/$name"
     GOOS="$os" GOARCH="$arch" GOAMD64=v3 GOARM64=v8.0 \
       go build -tags "$tags" -trimpath -ldflags "$ldflags" -o "$path" .
     bash scripts/check-lite.sh "$path" "$capability" --metadata-only
@@ -71,9 +66,9 @@ for capability in "${profiles[@]}"; do
       if grep -Fxq "$os-$output" scripts/upx-targets.txt; then
         upx_name="${name%.exe}-upx"
         [[ "$os" != windows ]] || upx_name="$upx_name.exe"
-        cp "$path" "bin/local/$upx_name"
-        upx --best "bin/local/$upx_name"
-        upx -t "bin/local/$upx_name"
+        cp "$path" "$output_dir/$upx_name"
+        upx --best "$output_dir/$upx_name"
+        upx -t "$output_dir/$upx_name"
         produced+=("$upx_name")
       else
         printf 'Skipping UPX for unadmitted target: %s (%s)\n' "$os-$output" "$capability"
@@ -82,12 +77,12 @@ for capability in "${profiles[@]}"; do
   done
 done
 
-: > bin/local/build-info.txt
+: > "$output_dir/build-info.txt"
 for name in "${produced[@]}"; do
-  file "bin/local/$name"
-  go version -m "bin/local/$name" >> bin/local/build-info.txt
- done
+  file "$output_dir/$name"
+  go version -m "$output_dir/$name" >> "$output_dir/build-info.txt"
+done
 (
-  cd bin/local
+  cd "$output_dir"
   sha256sum "${produced[@]}" > SHA256SUMS
 )

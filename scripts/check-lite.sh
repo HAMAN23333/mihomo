@@ -3,11 +3,11 @@ set -euo pipefail
 binary="$1"
 profile="$2"
 mode="${3:-}"
-case "$profile" in
-  gvisor) expect_gvisor=true ;;
-  no-gvisor) expect_gvisor=false ;;
-  *) printf 'Unknown Lite capability profile: %s\n' "$profile" >&2; exit 2 ;;
-esac
+scripts="$(cd "$(dirname "$0")" && pwd)"
+source "$scripts/lite-profile.sh"
+lite_profile "$profile"
+expect_gvisor="$LITE_PROFILE_EXPECT_GVISOR"
+expected_tags="$(<"$LITE_PROFILE_TAGS_FILE")"
 case "$mode" in
   ''|--packed|--metadata-only) ;;
   *) printf 'Unknown Lite check mode: %s\n' "$mode" >&2; exit 2 ;;
@@ -15,16 +15,12 @@ esac
 if [[ "$mode" != --packed ]]; then
   info="$(go version -m "$binary")"
   tags="$(grep -E -- '-tags=.*' <<< "$info" || true)"
-  for tag in no_tailscale no_zerotier no_easytier; do
+  for tag in $expected_tags; do
     if ! grep -qw "$tag" <<< "$tags"; then
       printf 'Missing Lite build tag: %s\n' "$tag" >&2; exit 1
     fi
   done
-  if "$expect_gvisor"; then
-    if ! grep -qw with_gvisor <<< "$tags"; then
-      printf 'Missing Lite build tag: with_gvisor\n' >&2; exit 1
-    fi
-  elif grep -qw with_gvisor <<< "$tags"; then
+  if ! "$expect_gvisor" && grep -qw with_gvisor <<< "$tags"; then
     printf 'Unexpected no-GVisor build tag: with_gvisor\n' >&2; exit 1
   fi
   if grep -Eq 'dep[[:space:]]+github.com/(metacubex/(tailscale|zerotier-go)|easytier/easytier/easytier-go)[[:space:]]' <<< "$info"; then
@@ -38,12 +34,10 @@ fi
 # Resolve the executable before changing to isolated configuration directories.
 binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
 version="$("$binary" -v)"
-for tag in no_tailscale no_zerotier no_easytier; do
+for tag in $expected_tags; do
   grep -qw "$tag" <<< "$version"
 done
-if "$expect_gvisor"; then
-  grep -qw with_gvisor <<< "$version"
-else
+if ! "$expect_gvisor"; then
   ! grep -qw with_gvisor <<< "$version"
   exit 0
 fi
