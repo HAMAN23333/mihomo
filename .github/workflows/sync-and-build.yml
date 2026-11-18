@@ -1,0 +1,201 @@
+name: Sync upstream and build lite
+
+# Mirrors MetaCubeX/mihomo's Meta branch into this fork, builds a lite
+# binary set (no gVisor / ZeroTier / Tailscale / EasyTier) and publishes
+# the rolling `lite-latest` release.
+#
+# The automation lives on `main`; `Meta` is kept as an exact mirror of
+# upstream, so do not commit to `Meta` in this fork.
+
+on:
+  schedule:
+    # Every 3 hours (UTC). Adjust if you want faster/slower tracking.
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Rebuild even if upstream Meta has not changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-and-build-lite
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: MetaCubeX/mihomo
+  BRANCH: Meta
+  # gVisor is opt-in (with_gvisor), so it is simply not passed here.
+  BUILD_TAGS: "no_zerotier no_tailscale no_easytier"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - name: Checkout fork Meta
+        uses: actions/checkout@v6
+        with:
+          ref: Meta
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mirror upstream Meta
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --force upstream "${BRANCH}"
+
+          NEW_SHA="$(git rev-parse "upstream/${BRANCH}")"
+          OLD_SHA="$(git rev-parse HEAD)"
+          FORCE="${{ inputs.force_build }}"
+          echo "upstream: ${NEW_SHA}"
+          echo "fork:     ${OLD_SHA}"
+
+          if [ "${NEW_SHA}" = "${OLD_SHA}" ] && [ "${FORCE}" != "true" ]; then
+            echo "No upstream change; nothing to build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "sha=${NEW_SHA}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Mirror exactly: fork Meta == upstream Meta.
+          git reset --hard "${NEW_SHA}"
+          git push --force origin "HEAD:${BRANCH}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "sha=${NEW_SHA}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [sync]
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, output: linux-amd64 }
+          - { goos: linux,   goarch: arm64, output: linux-arm64 }
+          - { goos: windows, goarch: amd64, output: windows-amd64 }
+          - { goos: windows, goarch: arm64, output: windows-arm64 }
+          - { goos: darwin,  goarch: amd64, output: darwin-amd64 }
+          - { goos: darwin,  goarch: arm64, output: darwin-arm64 }
+    steps:
+      - name: Checkout synced Meta
+        uses: actions/checkout@v6
+        with:
+          ref: Meta
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          VERSION="lite-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)"
+          BUILDTIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          NAME="mihomo-lite-${{ matrix.output }}-${VERSION}"
+          BIN="mihomo-lite-${{ matrix.output }}"
+          EXT=""
+          if [ "${GOOS}" = "windows" ]; then EXT=".exe"; fi
+
+          echo "tags: ${BUILD_TAGS}"
+          go build -v \
+            -tags "${BUILD_TAGS}" \
+            -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid=" \
+            -o "${BIN}${EXT}" .
+
+          if [ "${GOOS}" = "windows" ]; then
+            zip -j "${NAME}.zip" "${BIN}${EXT}"
+            rm -f "${BIN}${EXT}"
+          else
+            gzip -c "${BIN}" > "${NAME}.gz"
+            rm -f "${BIN}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: "${{ matrix.output }}"
+          path: mihomo-lite-*.*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Move lite-latest tag to built commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="${{ needs.sync.outputs.sha }}"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/lite-latest" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/lite-latest" \
+              -f sha="${SHA}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/lite-latest" -f sha="${SHA}" >/dev/null
+          fi
+
+      - name: Remove previous assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          names="$(gh release view lite-latest --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          for name in $names; do
+            gh release delete-asset lite-latest "$name" -y
+          done
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd dist
+          find . -type f -not -name "checksums.txt" | sort | xargs sha256sum > checksums.txt
+          cat checksums.txt
+
+      - name: Publish lite-latest
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: lite-latest
+          name: "Lite build - no gVisor / ZeroTier / Tailscale / EasyTier"
+          prerelease: false
+          make_latest: true
+          files: dist/*
+          body: |
+            Built automatically from upstream `MetaCubeX/mihomo` @ `${{ needs.sync.outputs.sha }}`.
+
+            Build tags: `no_zerotier no_tailscale no_easytier` (gVisor not enabled).
+
+            Assets include SHA256 checksums.
