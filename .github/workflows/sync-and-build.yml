@@ -147,6 +147,10 @@ jobs:
     needs: [sync, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # No checkout in this job, so gh cannot infer the repository.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -155,8 +159,6 @@ jobs:
           merge-multiple: true
 
       - name: Move lite-latest tag to built commit
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           SHA="${{ needs.sync.outputs.sha }}"
@@ -169,11 +171,10 @@ jobs:
           fi
 
       - name: Remove previous assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          names="$(gh release view lite-latest --json assets --jq '.assets[].name' 2>/dev/null || true)"
+          names="$(gh release view lite-latest --json assets --jq '.assets[].name')"
+          echo "existing assets: ${names:-none}"
           for name in $names; do
             gh release delete-asset lite-latest "$name" -y
           done
